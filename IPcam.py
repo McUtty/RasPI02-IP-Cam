@@ -13,6 +13,7 @@ import logging
 import ssl
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import BufferedIOBase
 from pathlib import Path
 from threading import Condition
 
@@ -21,7 +22,7 @@ from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 
 
-class StreamingOutput:
+class StreamingOutput(BufferedIOBase):
     """Holds the latest frame from the MJPEG encoder.
 
     The Picamera2 encoder writes frames to this object. Whenever a new JPEG
@@ -46,6 +47,11 @@ class StreamingOutput:
                 self.frame = buf
                 self.condition.notify_all()
         return len(buf)
+
+    def writable(self) -> bool:
+        """Report write capability for ``io.BufferedIOBase`` checks."""
+
+        return True
 
 
 output: StreamingOutput | None = None
