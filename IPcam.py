@@ -13,9 +13,11 @@ import logging
 import ssl
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from io import BufferedIOBase
 from pathlib import Path
 from threading import Condition
+from typing import Optional
 
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
@@ -92,19 +94,23 @@ class StreamingHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
             self.end_headers()
 
-            while True:
-                with output.condition:
-                    output.condition.wait()
-                    frame = output.frame
-                if frame is None:
-                    continue
+            try:
+                while True:
+                    with output.condition:
+                        output.condition.wait()
+                        frame = output.frame
+                    if frame is None:
+                        continue
 
-                self.wfile.write(b"--FRAME\r\n")
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", len(frame))
-                self.end_headers()
-                self.wfile.write(frame)
-                self.wfile.write(b"\r\n")
+                    self.wfile.write(b"--FRAME\r\n")
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", len(frame))
+                    self.end_headers()
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                logging.info("Client disconnected from stream")
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
             self.end_headers()
@@ -116,18 +122,26 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Picamera2 MJPEG HTTPS server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind the HTTPS server")
-    parser.add_argument("--port", type=int, default=8443, help="Port to bind the HTTPS server")
+    parser = argparse.ArgumentParser(description="Picamera2 MJPEG camera server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind the server")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "Port to bind the server. Defaults to 8443 when TLS is enabled and "
+            "8000 for HTTP."
+        ),
+    )
     parser.add_argument(
         "--cert",
-        default="cert.pem",
-        help="Path to the TLS certificate file (PEM)",
+        default=None,
+        help="Path to the TLS certificate file (PEM). Provide together with --key to enable HTTPS.",
     )
     parser.add_argument(
         "--key",
-        default="key.pem",
-        help="Path to the TLS private key file (PEM)",
+        default=None,
+        help="Path to the TLS private key file (PEM). Provide together with --cert to enable HTTPS.",
     )
     return parser.parse_args()
 
@@ -138,17 +152,47 @@ def create_ssl_context(cert_path: Path, key_path: Path) -> ssl.SSLContext:
     return context
 
 
+class StreamingServer(ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server that optionally wraps client sockets with TLS."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
+        self.ssl_context = ssl_context
+        super().__init__(server_address, handler_class)
+
+    def get_request(self):  # type: ignore[override]
+        request, client_address = super().get_request()
+        if self.ssl_context is not None:
+            request = self.ssl_context.wrap_socket(request, server_side=True)
+        return request, client_address
+
+
 def main() -> None:
     args = parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
-    cert_path = Path(args.cert)
-    key_path = Path(args.key)
-    if not cert_path.exists():
-        raise FileNotFoundError(f"TLS certificate not found: {cert_path}")
-    if not key_path.exists():
-        raise FileNotFoundError(f"TLS private key not found: {key_path}")
+    cert_path: Optional[Path] = Path(args.cert) if args.cert else None
+    key_path: Optional[Path] = Path(args.key) if args.key else None
+    if bool(cert_path) ^ bool(key_path):
+        raise ValueError("TLS requires both --cert and --key to be provided together.")
+    use_tls = cert_path is not None and key_path is not None
+
+    if use_tls:
+        if not cert_path.exists():
+            raise FileNotFoundError(f"TLS certificate not found: {cert_path}")
+        if not key_path.exists():
+            raise FileNotFoundError(f"TLS private key not found: {key_path}")
+    else:
+        logging.warning("TLS-Zertifikat nicht angegeben – Stream wird unverschlüsselt per HTTP bereitgestellt.")
 
     picam2 = Picamera2()
     camera_config = picam2.create_preview_configuration(
@@ -161,13 +205,12 @@ def main() -> None:
 
     picam2.start_recording(MJPEGEncoder(), FileOutput(output))
 
-    address = (args.host, args.port)
-    server = HTTPServer(address, StreamingHandler)
+    port = args.port if args.port is not None else (8443 if use_tls else 8000)
+    address = (args.host, port)
+    ssl_context = create_ssl_context(cert_path, key_path) if use_tls else None
+    server = StreamingServer(address, StreamingHandler, ssl_context=ssl_context)
 
-    ssl_context = create_ssl_context(cert_path, key_path)
-    server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
-
-    scheme = "https"
+    scheme = "https" if use_tls else "http"
     try:
         logging.info("Starting camera stream on %s://%s:%s", scheme, *address)
         server.serve_forever()

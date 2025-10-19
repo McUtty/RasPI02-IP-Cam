@@ -54,6 +54,9 @@ python IPcam.py --cert cert.pem --key key.pem --host 0.0.0.0 --port 8443
 When you access `https://your-hostname.local:8443/` from a browser that trusts the mkcert
 CA you should see the MJPEG stream.
 
+> **Hinweis:** Wenn Sie `IPcam.py` ohne `--cert` und `--key` starten, wird der Stream weiterhin
+> ausgeliefert, jedoch unverschlüsselt über HTTP (Standard-Port `8000`).
+
 ## 5. Distributing trust to other devices
 
 Devices that did not run `mkcert -install` will not automatically trust the certificate.
